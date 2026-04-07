@@ -1,0 +1,31 @@
+{
+  "name": "rest-api-mcp",
+  "version": "1.3.0",
+  "description": "MCP server for authenticated REST API calls — auto-login, Swagger spec fetch, and guided Flutter implementation",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "rest-api-mcp": "build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node build/index.js",
+    "inspector": "npx @modelcontextprotocol/inspector build/index.js"
+  },
+  "files": [
+    "build",
+    "guide.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.7.9"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
