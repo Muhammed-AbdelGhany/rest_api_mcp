@@ -46,22 +46,33 @@
 
 ## Installation
 
-### Option A — Use locally (recommended while developing)
+### Option A — Use via npx (recommended)
 
-```bash
-git clone https://github.com/your-org/rest-api-mcp
-cd rest-api-mcp
-npm install && npm run build
-```
-
-Then point VS Code at the local build (see [VS Code mcp.json Examples](#vs-code-mcpjson-examples)).
-
-### Option B — Use via npx (after npm publish)
+No installation needed. Add this to your project's `.vscode/mcp.json` and VS Code will download and run the package automatically:
 
 ```json
 {
   "command": "npx",
   "args": ["-y", "rest-api-mcp"]
+}
+```
+
+This always uses the latest published version from npm. See [VS Code mcp.json Examples](#vs-code-mcpjson-examples) for a full config.
+
+### Option B — Use locally (for development / offline)
+
+```bash
+git clone https://github.com/Muhammed-AbdelGhany/rest_api_mcp
+cd rest_api_mcp
+npm install && npm run build
+```
+
+Then point VS Code at the local build:
+
+```json
+{
+  "command": "node",
+  "args": ["/path/to/rest_api_mcp/build/index.js"]
 }
 ```
 
@@ -75,8 +86,8 @@ Add this to your project's `.vscode/mcp.json`:
 {
   "servers": {
     "my-api": {
-      "command": "node",
-      "args": ["/path/to/rest-api-mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "rest-api-mcp"],
       "env": {
         "REST_BASE_URL": "https://api.example.com/api/v1",
         "API_EMAIL": "user@example.com",
@@ -377,8 +388,8 @@ In this example, `shop-api` uses a simple role-based login and `analytics-api` u
 {
   "servers": {
     "shop-api": {
-      "command": "node",
-      "args": ["/path/to/rest-api-mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "rest-api-mcp"],
       "env": {
         "REST_BASE_URL": "https://api.acme-shop.com/v1",
         "API_EMAIL": "admin@acme-shop.com",
@@ -388,8 +399,8 @@ In this example, `shop-api` uses a simple role-based login and `analytics-api` u
       }
     },
     "analytics-api": {
-      "command": "node",
-      "args": ["/path/to/rest-api-mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "rest-api-mcp"],
       "env": {
         "REST_BASE_URL": "https://analytics.acme.com/api/v2",
         "API_EMAIL": "analyst@acme.com",
@@ -414,8 +425,8 @@ In this example, `shop-api` uses a simple role-based login and `analytics-api` u
 {
   "servers": {
     "my-api": {
-      "command": "node",
-      "args": ["/path/to/rest-api-mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "rest-api-mcp"],
       "env": {
         "REST_BASE_URL": "https://api.example.com/v1",
         "API_EMAIL": "user@example.com",
@@ -432,8 +443,8 @@ In this example, `shop-api` uses a simple role-based login and `analytics-api` u
 {
   "servers": {
     "my-api": {
-      "command": "node",
-      "args": ["/path/to/rest-api-mcp/build/index.js"],
+      "command": "npx",
+      "args": ["-y", "rest-api-mcp"],
       "env": {
         "REST_BASE_URL": "https://api.example.com/v1",
         "REST_ENABLE_SSL_VERIFY": "false",
