@@ -78,7 +78,7 @@ async function discoverLoginEndpoint(): Promise<string> {
     // Priority: exact "login" path > path containing "login" > fallback
     const candidates = Object.entries(paths)
       .filter(([, methods]) => typeof methods === "object" && methods !== null && "post" in methods)
-      .map(([path]) => path.replace(/^.*\/api\/[^/]+/, "")); // strip base prefix like /dawana-service/api/v1
+      .map(([path]) => path.replace(/^.*\/api\/[^/]+/, "")); // strip base prefix like /service/api/v1
 
     const exact = candidates.find(p => p.toLowerCase().endsWith("/login"));
     const contains = candidates.find(p => p.toLowerCase().includes("login"));
@@ -346,7 +346,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const paths: Record<string, Record<string, unknown>> = res.data?.paths ?? {};
       const keywords = query.split(/\s+/).filter(Boolean);
 
-      // Strip the spec's base prefix (e.g. /dawana-service/api/v1) from each path
+      // Strip the spec's base prefix (e.g. /service/api/v1) from each path
       // so the returned paths match what request() expects.
       const specBasePaths = Object.keys(paths);
       const basePrefix = (() => {
