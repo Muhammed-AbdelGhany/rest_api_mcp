@@ -137,6 +137,134 @@ function findSessionFieldCandidates(obj: unknown, prefix = ""): Array<{ path: st
   return results;
 }
 
+// ── OpenAPI schema helpers for describe_endpoint ──────────────────────────────
+function resolveRef(spec: Record<string, unknown>, ref: string): Record<string, unknown> | null {
+  if (!ref.startsWith("#/")) return null;
+  const path = ref.slice(2).split("/");
+  let current: unknown = spec;
+  for (const key of path) {
+    if (current && typeof current === "object") {
+      current = (current as Record<string, unknown>)[key];
+    } else {
+      return null;
+    }
+  }
+  return current && typeof current === "object" ? (current as Record<string, unknown>) : null;
+}
+
+function resolveSchema(schema: Record<string, unknown>, spec: Record<string, unknown>): Record<string, unknown> {
+  if (schema.$ref && typeof schema.$ref === "string") {
+    const resolved = resolveRef(spec, schema.$ref);
+    return resolved ?? schema;
+  }
+  if (schema.allOf && Array.isArray(schema.allOf)) {
+    const merged: Record<string, unknown> = {};
+    for (const item of schema.allOf) {
+      if (item && typeof item === "object") {
+        const resolved = resolveSchema(item as Record<string, unknown>, spec);
+        Object.assign(merged, resolved);
+      }
+    }
+    return merged;
+  }
+  return schema;
+}
+
+function extractSchemaInfo(schema: Record<string, unknown>, spec: Record<string, unknown>, depth = 0): Record<string, unknown> {
+  if (depth > 5) return { type: "object", description: "[nested too deeply]" };
+
+  const resolved = resolveSchema(schema, spec);
+  const info: Record<string, unknown> = {};
+
+  if (resolved.type) info.type = resolved.type;
+  if (resolved.format) info.format = resolved.format;
+  if (resolved.description) info.description = resolved.description;
+  if (resolved.enum) info.enum = resolved.enum;
+  if (resolved.nullable) info.nullable = true;
+  if (resolved.default !== undefined) info.default = resolved.default;
+
+  if (resolved.type === "array" && resolved.items) {
+    info.items = extractSchemaInfo(resolved.items as Record<string, unknown>, spec, depth + 1);
+  }
+
+  if (resolved.properties) {
+    const props: Record<string, unknown> = {};
+    const required = (resolved.required as string[]) ?? [];
+    for (const [key, val] of Object.entries(resolved.properties)) {
+      if (val && typeof val === "object") {
+        const propInfo = extractSchemaInfo(val as Record<string, unknown>, spec, depth + 1);
+        if (required.includes(key)) propInfo.required = true;
+        props[key] = propInfo;
+      }
+    }
+    info.properties = props;
+  }
+
+  if (resolved.oneOf && Array.isArray(resolved.oneOf)) {
+    info.oneOf = resolved.oneOf.map((s) =>
+      s && typeof s === "object" ? extractSchemaInfo(s as Record<string, unknown>, spec, depth + 1) : s
+    );
+  }
+
+  return info;
+}
+
+function generateExample(schema: Record<string, unknown>, spec: Record<string, unknown>, depth = 0): unknown {
+  if (depth > 5) return null;
+
+  const resolved = resolveSchema(schema, spec);
+
+  if (resolved.example !== undefined) return resolved.example;
+  if (resolved.default !== undefined) return resolved.default;
+
+  const type = resolved.type as string;
+
+  switch (type) {
+    case "string": {
+      const format = resolved.format as string;
+      if (format === "uuid") return "550e8400-e29b-41d4-a716-446655440000";
+      if (format === "email") return "user@example.com";
+      if (format === "date") return "2026-05-04";
+      if (format === "date-time") return "2026-05-04T12:00:00Z";
+      if (format === "uri" || format === "url") return "https://example.com";
+      if (resolved.enum && Array.isArray(resolved.enum) && resolved.enum.length > 0) return resolved.enum[0];
+      return "string";
+    }
+    case "integer":
+    case "number": {
+      if (resolved.minimum !== undefined) return resolved.minimum;
+      return 0;
+    }
+    case "boolean":
+      return false;
+    case "array": {
+      if (resolved.items) {
+        const item = generateExample(resolved.items as Record<string, unknown>, spec, depth + 1);
+        return item !== null ? [item] : [];
+      }
+      return [];
+    }
+    case "object": {
+      if (!resolved.properties) return {};
+      const obj: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(resolved.properties)) {
+        if (val && typeof val === "object") {
+          obj[key] = generateExample(val as Record<string, unknown>, spec, depth + 1);
+        }
+      }
+      return obj;
+    }
+    default:
+      return null;
+  }
+}
+
+function findBasePrefix(specPaths: string[]): string {
+  if (!specPaths.length) return "";
+  const m = specPaths[0]?.match(/^(\/[^/]+\/api\/v\d+)/);
+  return m ? m[1] : "";
+}
+
 // ── Auto-discover login endpoint from Swagger spec ─────────────────────────────
 async function discoverLoginEndpoint(): Promise<string> {
   if (LOGIN_ENDPOINT_OVERRIDE) return LOGIN_ENDPOINT_OVERRIDE;
@@ -374,6 +502,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "describe_endpoint",
+      description:
+        "Returns the full OpenAPI schema for a single endpoint: parameters, request body schema with types and required fields, " +
+        "response schemas, and a generated example request body. Use this before calling request() when you need to know " +
+        "exactly what fields to include in the body or what response shape to expect.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          method: {
+            type: "string",
+            enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+            description: "HTTP method of the endpoint",
+          },
+          endpoint: {
+            type: "string",
+            description: "API path relative to REST_BASE_URL, e.g. /inspections or /pharmacy/getMyPharmacy",
+          },
+        },
+        required: ["method", "endpoint"],
+      },
+    },
+    {
       name: "inspect_login",
       description:
         "Performs the login flow (and optional 2FA verify) and returns the raw server responses " +
@@ -550,6 +700,125 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { content: [{ type: "text", text: `Error fetching spec: ${msg}` }] };
+    }
+  }
+
+  // ── describe_endpoint ───────────────────────────────────────────────────────
+  if (name === "describe_endpoint") {
+    const method = (args?.method as string).toLowerCase();
+    const endpoint = args?.endpoint as string;
+    const specUrl = SWAGGER_URL;
+
+    if (!specUrl) {
+      return { content: [{ type: "text", text: "Error: API_SWAGGER_URL env var is not set." }] };
+    }
+
+    try {
+      const res = await axios.get(specUrl, { httpsAgent: httpsAgent() });
+      const spec: Record<string, unknown> = res.data;
+      const paths: Record<string, Record<string, unknown>> = (spec.paths as Record<string, Record<string, unknown>>) ?? {};
+
+      const basePrefix = findBasePrefix(Object.keys(paths));
+
+      // Try exact match first, then fuzzy
+      let rawPath = Object.keys(paths).find(p => p.replace(basePrefix, "") === endpoint || p === endpoint);
+      if (!rawPath) {
+        rawPath = Object.keys(paths).find(p => {
+          const clean = p.replace(basePrefix, "");
+          return clean.toLowerCase() === endpoint.toLowerCase();
+        });
+      }
+      if (!rawPath) {
+        return { content: [{ type: "text", text: `Endpoint not found in spec: ${method.toUpperCase()} ${endpoint}` }] };
+      }
+
+      const methods = paths[rawPath];
+      const operation = methods[method] as Record<string, unknown> | undefined;
+      if (!operation) {
+        const available = Object.keys(methods).filter(m => ["get","post","put","patch","delete"].includes(m));
+        return { content: [{ type: "text", text: `Method ${method.toUpperCase()} not found for ${endpoint}. Available: ${available.join(", ").toUpperCase()}` }] };
+      }
+
+      const cleanPath = rawPath.replace(basePrefix, "") || rawPath;
+
+      // Extract parameters
+      const parameters: Array<Record<string, unknown>> = [];
+      for (const p of (operation.parameters as Array<Record<string, unknown>> | undefined ?? [])) {
+        const param: Record<string, unknown> = {
+          name: p.name,
+          in: p.in,
+          required: p.required ?? false,
+        };
+        if (p.description) param.description = p.description;
+        if (p.schema && typeof p.schema === "object") {
+          const schemaInfo = extractSchemaInfo(p.schema as Record<string, unknown>, spec);
+          param.type = schemaInfo.type;
+          if (schemaInfo.format) param.format = schemaInfo.format;
+          if (schemaInfo.enum) param.enum = schemaInfo.enum;
+          if (schemaInfo.nullable) param.nullable = true;
+        }
+        parameters.push(param);
+      }
+
+      // Extract request body
+      let requestBody: Record<string, unknown> | null = null;
+      const reqBody = operation.requestBody as Record<string, unknown> | undefined;
+      if (reqBody) {
+        const content = (reqBody.content as Record<string, unknown>) ?? {};
+        const jsonContent = content["application/json"] as Record<string, unknown> | undefined;
+        if (jsonContent?.schema && typeof jsonContent.schema === "object") {
+          const schema = jsonContent.schema as Record<string, unknown>;
+          requestBody = {
+            contentType: "application/json",
+            schema: extractSchemaInfo(schema, spec),
+            example: generateExample(schema, spec),
+          };
+        }
+      }
+
+      // Extract responses
+      const responses: Record<string, unknown> = {};
+      const opResponses = (operation.responses as Record<string, unknown>) ?? {};
+      for (const [statusCode, resp] of Object.entries(opResponses)) {
+        if (resp && typeof resp === "object") {
+          const respObj = resp as Record<string, unknown>;
+          const respInfo: Record<string, unknown> = {};
+          if (respObj.description) respInfo.description = respObj.description;
+
+          const content = (respObj.content as Record<string, unknown>) ?? {};
+          const jsonContent = content["application/json"] as Record<string, unknown> | undefined;
+          if (jsonContent?.schema && typeof jsonContent.schema === "object") {
+            const schema = jsonContent.schema as Record<string, unknown>;
+            respInfo.schema = extractSchemaInfo(schema, spec);
+            respInfo.example = generateExample(schema, spec);
+          }
+
+          responses[statusCode] = respInfo;
+        }
+      }
+
+      const result = {
+        method: method.toUpperCase(),
+        path: cleanPath,
+        fullPath: rawPath,
+        summary: operation.summary ?? null,
+        description: operation.description ?? null,
+        operationId: operation.operationId ?? null,
+        tags: operation.tags ?? [],
+        parameters,
+        requestBody,
+        responses,
+      };
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(result, null, 2),
+        }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text", text: `Error describing endpoint: ${msg}` }] };
     }
   }
 

@@ -13,6 +13,7 @@
 - [Configuration](#configuration)
 - [Tools](#tools)
   - [search_endpoints](#search_endpoints)
+  - [describe_endpoint](#describe_endpoint)
   - [request](#request)
   - [fetch_spec](#fetch_spec)
   - [inspect_login](#inspect_login)
@@ -173,6 +174,65 @@ Found 6 match(es) for "orders list customer", showing top 5:
    Required params: body
 ...
 ```
+
+---
+
+### `describe_endpoint`
+
+Returns the full OpenAPI schema for a **single endpoint**: parameters, request body schema (with types, required flags, enums, examples), response schemas, and a **generated example request body**. Use this before `request()` when you need to know exactly what fields to include in the body or what response shape to expect.
+
+**Input:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | ✅ | `GET`, `POST`, `PUT`, `PATCH`, `DELETE` |
+| `endpoint` | string | ✅ | Path relative to `REST_BASE_URL`, e.g. `/inspections` |
+
+**Example — Inspect a POST endpoint before calling it:**
+
+```
+describe_endpoint("POST", "/pharmacy/add-manager")
+```
+
+**Response:**
+
+```json
+{
+  "method": "POST",
+  "path": "/pharmacy/add-manager",
+  "summary": "Add a manager to a pharmacy",
+  "parameters": [
+    { "name": "pharmacyId", "in": "path", "required": true, "type": "string" }
+  ],
+  "requestBody": {
+    "contentType": "application/json",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "first_name": { "type": "string", "required": true },
+        "email": { "type": "string", "required": true },
+        "gender": { "type": "string", "enum": ["male", "female"], "required": true },
+        "start_date": { "type": "string", "format": "date-time", "required": true }
+      }
+    },
+    "example": {
+      "first_name": "First name",
+      "email": "manager@example.com",
+      "gender": "male",
+      "start_date": "2026-05-04T12:00:00Z"
+    }
+  },
+  "responses": {
+    "201": {
+      "description": "Manager added successfully",
+      "schema": { "type": "object", "properties": { "id": { "type": "number" } } },
+      "example": { "id": 42 }
+    }
+  }
+}
+```
+
+The AI can now call `request()` with the exact body shape, no guessing required.
 
 ---
 
