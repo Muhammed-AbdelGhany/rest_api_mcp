@@ -15,6 +15,7 @@
   - [search_endpoints](#search_endpoints)
   - [request](#request)
   - [fetch_spec](#fetch_spec)
+  - [inspect_login](#inspect_login)
 - [Authentication Flows](#authentication-flows)
   - [Standard login](#standard-login)
   - [Login with extra credentials](#login-with-extra-credentials)
@@ -35,7 +36,9 @@
 | **Token caching** | 20-second TTL cache — survives rapid sequential calls |
 | **Auto-discovery** | Finds the login endpoint by scanning the Swagger spec (no config needed) |
 | **Auto token detection** | Tries 9 common token paths (`data.access_token`, `accessToken`, `token`, …) |
+| **AI-driven token detection** | `inspect_login` tool exposes raw responses + heuristic suggestions so the AI can pick the exact token path |
 | **2FA / OTP support** | Two-step auth: login → verify-otp, session identifiers forwarded automatically |
+| **Custom session fields** | Override hardcoded session candidates via `verify_session_fields` in `request()` |
 | **Extra login fields** | `source`, `userRole`, `channel`, `device_id` — any field, via JSON env var |
 | **Fuzzy endpoint search** | Find endpoints by keyword across path, summary, description, tags, operationId |
 | **Swagger spec fetch** | Retrieve and inspect the full OpenAPI spec |
@@ -186,6 +189,8 @@ Make an authenticated API call. Handles login automatically — re-logins transp
 | `body` | object | ❌ | Request body for POST/PUT/PATCH |
 | `headers` | object | ❌ | Extra headers to merge |
 | `skip_auth` | boolean | ❌ | Set `true` to skip the `Authorization` header |
+| `token_path` | string | ❌ | Dot-notation path to the token in the login/verify response (e.g. `data.result.accessToken`). Overrides auto-detection and is **cached** for re-logins. |
+| `verify_session_fields` | object | ❌ | Map of verify-body field names → dot-notation paths in the step-1 login response. Example: `{"sessionId": "data.result.sessionId"}`. Overrides hardcoded candidates and is **cached** for re-logins. |
 
 **Response shape:**
 
@@ -231,6 +236,63 @@ request("PATCH", "/products/42", {
 ```
 request("GET", "/health", skip_auth=true)
 ```
+
+**Example — Custom token path (when auto-detection fails):**
+
+```
+request("GET", "/orders", token_path="result.data.jwtToken")
+```
+
+**Example — Custom 2FA session fields:**
+
+```
+request("GET", "/orders",
+  token_path="data.result.accessToken",
+  verify_session_fields={"sessionId": "data.result.sessionId", "requestToken": "data.result.requestToken"}
+)
+```
+
+---
+
+### `inspect_login`
+
+Performs the login flow (and optional 2FA verify) and returns the **raw server responses** without extracting a token. Also returns **heuristic suggestions** for:
+- Token paths (fields that look like JWTs or long auth strings)
+- Session fields (fields that look like session identifiers for 2FA verify)
+
+Use this when auto-detection fails so the AI can identify the correct `token_path` and `verify_session_fields` to pass to `request()`.
+
+**No input required.**
+
+**Example — when `request()` fails with "Could not find token":**
+
+```
+inspect_login()
+```
+
+**Response:**
+
+```json
+{
+  "step1": { "status": 200, "data": { "result": { "customJwt": "eyJ...", "sessionId": "abc" } } },
+  "step2": null,
+  "token_suggestions": [
+    { "path": "result.customJwt", "value_preview": "eyJhbGciOiJIUzI1Ni...", "confidence": 4 }
+  ],
+  "session_field_suggestions": [
+    { "path": "result.sessionId", "key": "sessionId", "value_preview": "abc" }
+  ],
+  "note": "Use token_path and verify_session_fields in your next request() call."
+}
+```
+
+Then call `request()` with the AI-discovered path:
+
+```
+request("GET", "/orders", token_path="result.customJwt")
+```
+
+The server **caches** the AI-provided `token_path` and `verify_session_fields` so re-logins (after token expiry) use them automatically.
 
 ---
 
@@ -489,7 +551,7 @@ request("GET", "/orders?status=pending")
            │   Step 2: POST /auth/verify-otp  {email, otp, ...session_tokens}
            │            ◄── 200: {accessToken: "eyJ..."}
            │
-           ├─ Auto-detect token path from response
+           ├─ Auto-detect token path from response (or use AI-provided token_path)
            ├─ Cache token for 20s
            └─ attach Bearer token
      │
@@ -497,6 +559,20 @@ request("GET", "/orders?status=pending")
 GET /orders?status=pending
      Authorization: Bearer eyJ...
      ◄── 200: {total: 47, data: [{id: 1, status: "pending", ...}, ...]}
+```
+
+**When auto-detection fails:**
+```
+request("GET", "/orders")  ← "Could not find token"
+     │
+     ▼
+inspect_login()
+     │  Returns raw login response + token/session suggestions
+     ▼
+request("GET", "/orders", token_path="data.result.jwt")
+     │  Token path cached for future re-logins
+     ▼
+✅ Success
 ```
 
 ---
@@ -521,15 +597,24 @@ GET /orders?status=pending
 **Auto-detected token paths (tried in order):**
 `data.access_token` · `access_token` · `data.token` · `token` · `data.accessToken` · `accessToken` · `data.data.access_token` · `result.access_token` · `result.token`
 
+If none match, use `inspect_login()` to discover the correct path and pass it via `token_path`.
+
 **Auto-forwarded session fields (2FA step 1 → step 2):**
 `session_token` · `sessionToken` · `session` · `request_id` · `requestId` · `temp_token` · `tempToken` · `verification_token` · `verificationToken` · `challenge` · `nonce` · `transaction_id` · `transactionId`
+
+Override these via `verify_session_fields` when the API uses non-standard session field names.
 
 ---
 
 ## Troubleshooting
 
 **Login failed: Could not find token**  
-The login response uses an unusual token path. Set `API_TOKEN_PATH` explicitly:
+The login response uses an unusual token path. Use `inspect_login()` to see the raw response and heuristic suggestions, then pass the correct path to `request()`:
+```
+inspect_login()                    ← see suggestions
+request("GET", "/orders", token_path="result.data.jwt")
+```
+Alternatively, set `API_TOKEN_PATH` explicitly in env:
 ```json
 "API_TOKEN_PATH": "result.data.jwt"
 ```

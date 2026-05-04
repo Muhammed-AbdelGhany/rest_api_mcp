@@ -45,6 +45,10 @@ const TOKEN_TTL_MS = 20_000; // 20s — safe margin for short-lived tokens
 let discoveredLoginEndpoint: string | null = null;
 let discoveredTokenPath: string | null = null;
 
+// ── AI-provided overrides (set via request tool, cached for re-login) ─────────
+let aiTokenPath: string | null = null;
+let aiVerifySessionFields: Record<string, string> | null = null;
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 function getNestedValue(obj: unknown, path: string): unknown {
   return path.split(".").reduce<unknown>((curr, key) => {
@@ -63,6 +67,74 @@ function truncate(data: unknown): unknown {
     try { return JSON.parse(str); } catch { return str; }
   }
   return str.slice(0, RESPONSE_SIZE_LIMIT) + `\n\n[TRUNCATED: ${str.length} chars total, ${RESPONSE_SIZE_LIMIT} returned]`;
+}
+
+// ── Heuristic helpers for inspect_login ───────────────────────────────────────
+function scoreTokenLikeness(value: string): number {
+  let score = 0;
+  if (value.length < 10) return 0;                         // too short
+  if (value.length >= 20) score += 1;
+  if (value.length >= 40) score += 1;
+  if (value.startsWith("eyJ")) score += 3;                 // JWT header
+  if (/^[A-Za-z0-9_-]+$/.test(value)) score += 1;          // URL-safe base64-like
+  if (/^[A-Fa-f0-9]{32,}$/.test(value)) score += 1;        // hex-like
+  if (/\s/.test(value)) score -= 2;                        // contains spaces → unlikely token
+  if (/token|auth|bearer|jwt|access/i.test(value)) score -= 2; // label, not value
+  return Math.max(score, 0);
+}
+
+function findTokenCandidates(obj: unknown, prefix = ""): Array<{ path: string; value_preview: string; confidence: number }> {
+  const results: Array<{ path: string; value_preview: string; confidence: number }> = [];
+
+  function walk(current: unknown, path: string) {
+    if (typeof current === "string") {
+      const confidence = scoreTokenLikeness(current);
+      if (confidence > 0) {
+        results.push({
+          path: path || "(root)",
+          value_preview: current.slice(0, 40) + (current.length > 40 ? "..." : ""),
+          confidence,
+        });
+      }
+    } else if (Array.isArray(current)) {
+      current.forEach((item, i) => walk(item, `${path}[${i}]`));
+    } else if (current && typeof current === "object") {
+      for (const [key, val] of Object.entries(current)) {
+        const newPath = path ? `${path}.${key}` : key;
+        walk(val, newPath);
+      }
+    }
+  }
+
+  walk(obj, prefix);
+  return results.sort((a, b) => b.confidence - a.confidence);
+}
+
+const SESSION_KEYWORDS = /session|token|request|temp|verification|challenge|nonce|transaction/i;
+
+function findSessionFieldCandidates(obj: unknown, prefix = ""): Array<{ path: string; key: string; value_preview: string }> {
+  const results: Array<{ path: string; key: string; value_preview: string }> = [];
+
+  function walk(current: unknown, path: string) {
+    if (current && typeof current === "object" && !Array.isArray(current)) {
+      for (const [key, val] of Object.entries(current)) {
+        const newPath = path ? `${path}.${key}` : key;
+        if (typeof val === "string" && val.length > 0 && SESSION_KEYWORDS.test(key) && scoreTokenLikeness(val) > 0) {
+          results.push({
+            path: newPath,
+            key,
+            value_preview: val.slice(0, 40) + (val.length > 40 ? "..." : ""),
+          });
+        }
+        walk(val, newPath);
+      }
+    } else if (Array.isArray(current)) {
+      current.forEach((item, i) => walk(item, `${path}[${i}]`));
+    }
+  }
+
+  walk(obj, prefix);
+  return results;
 }
 
 // ── Auto-discover login endpoint from Swagger spec ─────────────────────────────
@@ -104,6 +176,7 @@ const TOKEN_PATH_CANDIDATES = [
 ];
 
 function detectTokenPath(responseData: unknown): string | null {
+  if (aiTokenPath) return aiTokenPath;
   if (TOKEN_PATH_OVERRIDE) return TOKEN_PATH_OVERRIDE;
   if (discoveredTokenPath) return discoveredTokenPath;
 
@@ -163,13 +236,23 @@ async function login(): Promise<TokenCache> {
     if (OTP)   verifyBody.otp   = OTP;
     if (EMAIL) verifyBody.email = EMAIL;
 
-    // Auto-carry session identifiers from step-1 response (top-level and data.*)
-    for (const field of SESSION_FIELD_CANDIDATES) {
-      const val =
-        getNestedValue(step1.data, field) ??
-        getNestedValue(step1.data, `data.${field}`);
-      if (typeof val === "string" && val.length > 0) {
-        verifyBody[field] = val;
+    // Auto-carry session identifiers from step-1 response
+    if (aiVerifySessionFields) {
+      for (const [key, path] of Object.entries(aiVerifySessionFields)) {
+        const val = getNestedValue(step1.data, path);
+        if (typeof val === "string" && val.length > 0) {
+          verifyBody[key] = val;
+        }
+      }
+    } else {
+      // Fallback to hardcoded candidates
+      for (const field of SESSION_FIELD_CANDIDATES) {
+        const val =
+          getNestedValue(step1.data, field) ??
+          getNestedValue(step1.data, `data.${field}`);
+        if (typeof val === "string" && val.length > 0) {
+          verifyBody[field] = val;
+        }
       }
     }
 
@@ -199,7 +282,7 @@ async function login(): Promise<TokenCache> {
       `Could not find token in ${VERIFY_ENDPOINT ? "verify" : "login"} response. ` +
       `Tried paths: ${TOKEN_PATH_CANDIDATES.join(", ")}. ` +
       `Response: ${JSON.stringify(finalData).slice(0, 500)}. ` +
-      `Set API_TOKEN_PATH env var explicitly.`
+      `Set API_TOKEN_PATH env var explicitly or use the token_path parameter in request().`
     );
   }
 
@@ -291,9 +374,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "inspect_login",
+      description:
+        "Performs the login flow (and optional 2FA verify) and returns the raw server responses " +
+        "without extracting a token. Also returns heuristic suggestions for token paths and session " +
+        "fields that could be forwarded to a verify endpoint. Use this when auto-detection fails " +
+        "so you can identify the correct token_path and verify_session_fields to pass to request().",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "request",
       description:
-        "Makes an authenticated API call. Handles login automatically — if the token is expired it re-logins transparently. Returns the full response body plus login_data (which contains IDs like pharmacyId returned from login).",
+        "Makes an authenticated API call. Handles login automatically — if the token is expired it re-logins transparently. " +
+        "Returns the full response body plus login_data (which contains IDs like pharmacyId returned from login). " +
+        "If auto-detection fails, use inspect_login first to discover the token path and session fields, " +
+        "then pass them via token_path and verify_session_fields.",
       inputSchema: {
         type: "object",
         properties: {
@@ -317,6 +415,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           skip_auth: {
             type: "boolean",
             description: "Set true to skip the Authorization header (e.g. for public endpoints)",
+          },
+          token_path: {
+            type: "string",
+            description: "Dot-notation path to the token in the login/verify response (e.g. 'data.result.accessToken'). Overrides auto-detection and is cached for re-logins.",
+          },
+          verify_session_fields: {
+            type: "object",
+            description:
+              "Object mapping verify-body field names to dot-notation paths in the step-1 login response. " +
+              "Example: {\"sessionId\": \"data.result.sessionId\", \"requestToken\": \"data.result.requestToken\"}. " +
+              "Overrides the hardcoded SESSION_FIELD_CANDIDATES and is cached for re-logins.",
+            additionalProperties: { type: "string" },
           },
         },
         required: ["method", "endpoint"],
@@ -443,6 +553,106 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
+  // ── inspect_login ───────────────────────────────────────────────────────────
+  if (name === "inspect_login") {
+    if (!EMAIL || !PASSWORD) {
+      return { content: [{ type: "text", text: "Error: API_EMAIL and API_PASSWORD env vars are required." }] };
+    }
+
+    try {
+      const loginEndpoint = await discoverLoginEndpoint();
+
+      // Step 1
+      const loginBody: Record<string, unknown> = { email: EMAIL, password: PASSWORD };
+      if (LOGIN_CREDENTIALS_JSON) {
+        try { Object.assign(loginBody, JSON.parse(LOGIN_CREDENTIALS_JSON)); }
+        catch { return { content: [{ type: "text", text: `Error: API_LOGIN_CREDENTIALS is not valid JSON.` }] }; }
+      }
+
+      const step1 = await axios.post(`${BASE_URL}${loginEndpoint}`, loginBody, {
+        headers: { "Content-Type": "application/json" },
+        httpsAgent: httpsAgent(),
+        validateStatus: () => true,
+      });
+
+      if (step1.status >= 400) {
+        return {
+          content: [{
+            type: "text",
+            text: `Login step 1 failed with status ${step1.status}:\n${JSON.stringify(step1.data, null, 2)}`,
+          }],
+        };
+      }
+
+      // Step 2 (optional)
+      let step2Response: unknown = null;
+      if (VERIFY_ENDPOINT) {
+        const verifyBody: Record<string, unknown> = {};
+        if (OTP)   verifyBody.otp   = OTP;
+        if (EMAIL) verifyBody.email = EMAIL;
+
+        for (const field of SESSION_FIELD_CANDIDATES) {
+          const val =
+            getNestedValue(step1.data, field) ??
+            getNestedValue(step1.data, `data.${field}`);
+          if (typeof val === "string" && val.length > 0) {
+            verifyBody[field] = val;
+          }
+        }
+
+        if (VERIFY_EXTRA_JSON) {
+          try { Object.assign(verifyBody, JSON.parse(VERIFY_EXTRA_JSON)); }
+          catch { return { content: [{ type: "text", text: `Error: API_VERIFY_CREDENTIALS is not valid JSON.` }] }; }
+        }
+
+        const step2 = await axios.post(`${BASE_URL}${VERIFY_ENDPOINT}`, verifyBody, {
+          headers: { "Content-Type": "application/json" },
+          httpsAgent: httpsAgent(),
+          validateStatus: () => true,
+        });
+
+        step2Response = { status: step2.status, data: step2.data };
+
+        if (step2.status >= 400) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                `2FA verify failed with status ${step2.status}.\n\n` +
+                `Step 1 response:\n${JSON.stringify(step1.data, null, 2)}\n\n` +
+                `Step 2 response:\n${JSON.stringify(step2.data, null, 2)}`,
+            }],
+          };
+        }
+      }
+
+      const inspectTarget = step2Response ? (step2Response as { data: unknown }).data : step1.data;
+
+      const tokenSuggestions = findTokenCandidates(inspectTarget);
+      const sessionSuggestions = findSessionFieldCandidates(step1.data);
+
+      const output = {
+        step1: { status: step1.status, data: step1.data },
+        step2: step2Response,
+        token_suggestions: tokenSuggestions.slice(0, 10),
+        session_field_suggestions: sessionSuggestions.slice(0, 10),
+        note:
+          "Use token_path (e.g. 'data.result.accessToken') and verify_session_fields " +
+          "(e.g. {\"sessionId\": \"data.result.sessionId\"}) in your next request() call.",
+      };
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(output, null, 2),
+        }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text", text: `inspect_login failed: ${msg}` }] };
+    }
+  }
+
   // ── request ─────────────────────────────────────────────────────────────────
   if (name === "request") {
     const method = (args?.method as string).toUpperCase();
@@ -450,6 +660,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const body = args?.body as Record<string, unknown> | undefined;
     const extraHeaders = (args?.headers as Record<string, string> | undefined) ?? {};
     const skipAuth = (args?.skip_auth as boolean | undefined) ?? false;
+    const requestedTokenPath = args?.token_path as string | undefined;
+    const requestedVerifyFields = args?.verify_session_fields as Record<string, string> | undefined;
+
+    // Cache AI-provided overrides so re-logins use them automatically
+    if (requestedTokenPath) {
+      aiTokenPath = requestedTokenPath;
+    }
+    if (requestedVerifyFields && typeof requestedVerifyFields === "object") {
+      aiVerifySessionFields = requestedVerifyFields;
+    }
 
     let authHeaders: Record<string, string> = {};
     let loginData: Record<string, unknown> = {};
